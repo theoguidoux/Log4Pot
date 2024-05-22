@@ -5,7 +5,7 @@ import os
 import re
 import socket
 import ssl
-import sys
+import sys, logging
 from argparse import ArgumentParser
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,14 +19,17 @@ from log4pot.deobfuscator import deobfuscate as deobfuscate
 
 re_exploit = re.compile("\${.*}")
 
+logging.basicConfig(level=logging.INFO)
+
+# Write to console
+logging.getLogger().addHandler(logging.StreamHandler())
+
+
 @dataclass
 class Logger:
     log_file: str
     log_blob: Optional["azure.storage.blob.BlobClient"]
     s3_log: Optional["S3Log"] = None
-
-    def __post_init__(self):
-        self.f = open(self.log_file, "a")
 
     def log(self, logtype: str, message: str, **kwargs):
         d = {
@@ -35,8 +38,8 @@ class Logger:
             **kwargs,
         }
         j = json.dumps(d) + "\n"
-        self.f.write(j)
-        self.f.flush()
+        logging.info(j)
+
         if self.log_blob is not None:
             self.log_blob.append_block(j)
 
@@ -47,8 +50,16 @@ class Logger:
         self.log("start", "Log4Pot started")
 
     def log_request(self, server_port, client, port, request, headers, uuid):
-        self.log("request", "A request was received", correlation_id=str(uuid), server_port=server_port, client=client,
-                 port=port, request=request, headers=dict(headers))
+        self.log(
+            "request",
+            "A request was received",
+            correlation_id=str(uuid),
+            server_port=server_port,
+            client=client,
+            port=port,
+            request=request,
+            headers=dict(headers),
+        )
 
     def log_exploit(self, location, payload, deobfuscated_payload, uuid):
         self.log(
@@ -57,8 +68,8 @@ class Logger:
             correlation_id=str(uuid),
             location=location,
             payload=payload,
-            deobfuscated_payload=deobfuscated_payload
-            )
+            deobfuscated_payload=deobfuscated_payload,
+        )
 
     def log_payload(self, uuid, **kwargs):
         self.log("payload", "Payload downloaded", correlation_id=str(uuid), **kwargs)
@@ -71,7 +82,6 @@ class Logger:
 
     def close(self):
         self.log_end()
-        self.f.close()
 
 
 class Log4PotHTTPRequestHandler(BaseHTTPRequestHandler):
@@ -86,14 +96,19 @@ class Log4PotHTTPRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(self.server.response)
 
         self.logger = self.server.logger
-        self.logger.log_request(self.server.server_address[1], *self.client_address, self.requestline, self.headers,
-                                self.uuid)
+        self.logger.log_request(
+            self.server.server_address[1],
+            *self.client_address,
+            self.requestline,
+            self.headers,
+            self.uuid,
+        )
         self.find_exploit("request", self.requestline)
         for header, value in self.headers.items():
             self.find_exploit(f"header-{header}", value)
 
     def find_exploit(self, location: str, content: str) -> bool:
-        if (m := re_exploit.search(content)):
+        if m := re_exploit.search(content):
             exploit = m.group(0)
             deobfuscated_exploit = self.server.deobfuscator(exploit)
             logger.log_exploit(location, exploit, deobfuscated_exploit, self.uuid)
@@ -116,12 +131,14 @@ class Log4PotHTTPServer(ThreadingHTTPServer):
     def __init__(
         self,
         logger: Logger,
-        payloader : "log4pot.payloader.Payloader",
-        server_header : str,
-        response : bytes,
-        content_type : str,
-        deobfuscator : Callable[[str], str],
-        *args, **kwargs):
+        payloader: "log4pot.payloader.Payloader",
+        server_header: str,
+        response: bytes,
+        content_type: str,
+        deobfuscator: Callable[[str], str],
+        *args,
+        **kwargs,
+    ):
         self.logger = logger
         self.payloader = payloader
         self.server_header = server_header
@@ -135,15 +152,17 @@ class Log4PotServerThread(Thread):
     def __init__(
         self,
         logger: Logger,
-        payloader : "log4pot.payloader.Payloader",
-        server_header : str,
-        response : bytes,
-        content_type : str,
-        deobfuscator : Callable[[str], str],
+        payloader: "log4pot.payloader.Payloader",
+        server_header: str,
+        response: bytes,
+        content_type: str,
+        deobfuscator: Callable[[str], str],
         port: int,
-        tls : bool,
-        certificate : Optional[str] = None,
-        *args, **kwargs):
+        tls: bool,
+        certificate: Optional[str] = None,
+        *args,
+        **kwargs,
+    ):
         self.port = port
         self.server = Log4PotHTTPServer(
             logger,
@@ -160,8 +179,8 @@ class Log4PotServerThread(Thread):
                 self.server.socket,
                 server_side=True,
                 certfile=certificate,
-                ssl_version=ssl.PROTOCOL_TLSv1_2
-                )
+                ssl_version=ssl.PROTOCOL_TLSv1_2,
+            )
         super().__init__(name=f"httpserver-{port}", *args, **kwargs)
 
     def run(self):
@@ -183,20 +202,81 @@ argparser = Log4PotArgumentParser(
     description="A honeypot for the Log4Shell vulnerability (CVE-2021-44228).",
     fromfile_prefix_chars="@",
 )
-argparser.add_argument("--port", "-p", action="append", type=str, help="Listening port. Prepend with 'S' to configure as TLS secured port. Certificate is configured with --certificate.")
-argparser.add_argument("--certificate", "-c", type=str, help="Certificate used for TLS.")
-argparser.add_argument("--response", "-r", type=str, default="responses/default.json", help="File used as response. Default: %(default)s")
-argparser.add_argument("--content-type", "-t", type=str, default="text/json", help="Content type of response. Default: %(default)s")
+argparser.add_argument(
+    "--port",
+    "-p",
+    action="append",
+    type=str,
+    help="Listening port. Prepend with 'S' to configure as TLS secured port. Certificate is configured with --certificate.",
+)
+argparser.add_argument(
+    "--certificate", "-c", type=str, help="Certificate used for TLS."
+)
+argparser.add_argument(
+    "--response",
+    "-r",
+    type=str,
+    default="responses/default.json",
+    help="File used as response. Default: %(default)s",
+)
+argparser.add_argument(
+    "--content-type",
+    "-t",
+    type=str,
+    default="text/json",
+    help="Content type of response. Default: %(default)s",
+)
 argparser.add_argument("--log", "-l", type=str, default="log4pot.log", help="Log file")
-argparser.add_argument("--blob-connection-string", "-b", help="Azure blob storage connection string.")
-argparser.add_argument("--log-container", "-lc", type=str, default="logs", help="Azure blob container for logs.")
-argparser.add_argument("--log-blob", "-lb", default=socket.gethostname() + ".log", help="Azure blob for logs.")
-argparser.add_argument("--server-header", type=str, default=None, help="Replace the default server header.")
-argparser.add_argument("--old-deobfuscator", "-O", action="store_true", help="Deobfuscate payloads with old deobfuscator.")
-argparser.add_argument("--payloader", "-P", action="store_true", help="Download any analyze payloads from exploit attempts.")
-argparser.add_argument("--download-dir", "-dd", type=str, help="Set a download directory for payloader. Only analysis is conducted ")
-argparser.add_argument("--download-container", "-dc", type=str, help="Azure blob container for downloaded payloads.")
-argparser.add_argument("--download-timeout", "-dt", type=int, default=10, help="Set download timeout for payloads.")
+argparser.add_argument(
+    "--blob-connection-string", "-b", help="Azure blob storage connection string."
+)
+argparser.add_argument(
+    "--log-container",
+    "-lc",
+    type=str,
+    default="logs",
+    help="Azure blob container for logs.",
+)
+argparser.add_argument(
+    "--log-blob",
+    "-lb",
+    default=socket.gethostname() + ".log",
+    help="Azure blob for logs.",
+)
+argparser.add_argument(
+    "--server-header", type=str, default=None, help="Replace the default server header."
+)
+argparser.add_argument(
+    "--old-deobfuscator",
+    "-O",
+    action="store_true",
+    help="Deobfuscate payloads with old deobfuscator.",
+)
+argparser.add_argument(
+    "--payloader",
+    "-P",
+    action="store_true",
+    help="Download any analyze payloads from exploit attempts.",
+)
+argparser.add_argument(
+    "--download-dir",
+    "-dd",
+    type=str,
+    help="Set a download directory for payloader. Only analysis is conducted ",
+)
+argparser.add_argument(
+    "--download-container",
+    "-dc",
+    type=str,
+    help="Azure blob container for downloaded payloads.",
+)
+argparser.add_argument(
+    "--download-timeout",
+    "-dt",
+    type=int,
+    default=10,
+    help="Set download timeout for payloads.",
+)
 argparser.add_argument("--s3-bucket", type=str, help="S3 bucket to upload logs to")
 
 args = argparser.parse_args()
@@ -204,10 +284,10 @@ if args.port is None:
     print("No port specified!", file=sys.stderr)
     sys.exit(1)
 
-if any([
-    (port.startswith("s") or port.startswith("S"))
-    for port in args.port
-]) and args.certificate is None:
+if (
+    any([(port.startswith("s") or port.startswith("S")) for port in args.port])
+    and args.certificate is None
+):
     print("TLS port requested but no certificate specified.")
     sys.exit(3)
 
@@ -222,7 +302,9 @@ if args.blob_connection_string is not None:
     except ImportError:
         print("Azure logging requested but no azure package installed!")
         sys.exit(2)
-    service_client = BlobServiceClient.from_connection_string(args.blob_connection_string)
+    service_client = BlobServiceClient.from_connection_string(
+        args.blob_connection_string
+    )
     log_container = service_client.get_container_client(args.log_container)
     download_container = service_client.get_container_client(args.download_container)
     log_blob = log_container.get_blob_client(args.log_blob)
@@ -239,8 +321,8 @@ if args.s3_bucket is not None:
         sys.exit(2)
     from log4pot.s3 import S3Log
 
-    s3_client=boto3.client('s3')
-    s3log=S3Log(s3_client, threshold=500, bucket=args.s3_bucket)
+    s3_client = boto3.client("s3")
+    s3log = S3Log(s3_client, threshold=500, bucket=args.s3_bucket)
 else:
     s3log = None
 
@@ -250,13 +332,17 @@ if args.payloader:
     try:
         from log4pot.payloader import Payloader
     except ImportError as e:
-        print("Payload analysis requested but no pycurl installed or libcurl not available!")
+        print(
+            "Payload analysis requested but no pycurl installed or libcurl not available!"
+        )
         sys.exit(2)
     try:
         os.mkdir(args.download_dir)
     except FileExistsError:
         pass
-    payloader = Payloader(args.download_dir, download_container, args.download_timeout, s3log)
+    payloader = Payloader(
+        args.download_dir, download_container, args.download_timeout, s3log
+    )
 else:
     payloader = None
 
@@ -278,7 +364,7 @@ threads = [
         int(port.strip("sS")),
         port.startswith("s") or port.startswith("S"),
         args.certificate,
-        )
+    )
     for port in args.port
 ]
 logger.log_start()
